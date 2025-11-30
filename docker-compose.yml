@@ -1,15 +1,14 @@
 version: '3'
 services:
-  # 1. The Frontend: Accessible by the User
   frontend:
     build: ./frontend
     ports:
       - "9000:8080"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock  # <--- CRITICAL LINE
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - public_net
-  # 2. The Middleware: Bridges Public and Private networks
+
   loadbalancer:
     image: nginx:alpine
     volumes:
@@ -20,13 +19,13 @@ services:
     depends_on:
       - backend
 
-  # 3. The Backend: Hidden in the private network
   backend:
     build: ./backend
     networks:
       - private_net
-
-networks:
-  public_net:
-  private_net:
-    internal: true # SECURITY DEMO: No external access allowed
+      
+  # --- NEW SERVICE ---
+  backend_node:
+    build: ./backend_node
+    # We don't start it automatically, we just want the image "distributed-systems-demo-backend_node"
+    profiles: ["donotstart"]
