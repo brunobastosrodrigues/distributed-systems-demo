@@ -4,7 +4,7 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "8080:8080"  # Maps VM port 8080 to container port 8080
+      - "9000:8080"  # Maps VM port 8080 to container port 8080
     networks:
       - public_net
 
