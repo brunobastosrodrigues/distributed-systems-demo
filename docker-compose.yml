@@ -23,9 +23,16 @@ services:
     build: ./backend
     networks:
       - private_net
-      
-  # --- NEW SERVICE ---
+
+  # 👇 ADD THIS NEW SECTION 👇
   backend_node:
     build: ./backend_node
-    # We don't start it automatically, we just want the image "distributed-systems-demo-backend_node"
-    profiles: ["donotstart"]
+    # This prevents it from starting automatically (we want to scale it manually via the UI)
+    profiles: ["donotstart"] 
+    networks:
+      - private_net
+
+networks:
+  public_net:
+  private_net:
+    internal: true
