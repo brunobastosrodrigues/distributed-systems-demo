@@ -1,0 +1,31 @@
+version: '3'
+services:
+  # 1. The Frontend: Accessible by the User
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:8080"  # Maps VM port 8080 to container port 8080
+    networks:
+      - public_net
+
+  # 2. The Middleware: Bridges Public and Private networks
+  loadbalancer:
+    image: nginx:alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - public_net
+      - private_net
+    depends_on:
+      - backend
+
+  # 3. The Backend: Hidden in the private network
+  backend:
+    build: ./backend
+    networks:
+      - private_net
+
+networks:
+  public_net:
+  private_net:
+    internal: true # SECURITY DEMO: No external access allowed
