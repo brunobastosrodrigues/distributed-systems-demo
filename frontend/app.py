@@ -2,6 +2,8 @@ from flask import Flask, jsonify
 import requests
 import docker
 import random
+import uuid
+import time
 
 app = Flask(__name__)
 client = docker.from_env()
@@ -10,21 +12,27 @@ client = docker.from_env()
 @app.route('/get-data')
 def get_data():
     try:
+        # 1 sec timeout so the UI doesn't freeze if Nginx is slow
         response = requests.get('http://loadbalancer:80/api', timeout=1)
         return jsonify(response.json())
-    except:
-        return jsonify({"served_by_node": "Offline"})
+    except Exception as e:
+        return jsonify({"served_by_node": "Offline", "error": str(e)})
 
-# --- Control Plane Logic (Docker Management) ---
+# --- Control Plane Logic ---
+
 def get_backend_containers():
-    """Returns a list of all Docker containers that are 'backend' nodes."""
-    return [c for c in client.containers.list() if "backend" in c.name and "frontend" not in c.name]
+    """Returns list of backend containers based on name or image."""
+    # Improved Filter: Looks for "backend" in the name OR the original image name
+    return [
+        c for c in client.containers.list() 
+        if "backend" in c.name and "frontend" not in c.name
+    ]
 
 @app.route('/api/status')
 def get_status():
-    """Returns the exact count and IDs of live nodes from Docker."""
+    """Returns real-time census from Docker Engine."""
     containers = get_backend_containers()
-    active_nodes = [c.short_id for c in containers]
+    active_nodes = [c.name.replace("distributed-systems-demo-", "") for c in containers]
     return jsonify({
         "count": len(active_nodes), 
         "nodes": active_nodes
@@ -33,19 +41,43 @@ def get_status():
 @app.route('/api/scale')
 def scale_up():
     try:
-        # Find any running backend to use as a template
-        containers = get_backend_containers()
-        if not containers: return jsonify({"status": "error", "msg": "No template node found!"})
-        template = containers[0]
-
-        net_name = list(template.attrs['NetworkSettings']['Networks'].keys())[0]
-        image = template.image.tags[0] if template.image.tags else template.image.id
-
-        # Add 3 nodes
-        for i in range(3):
-            client.containers.run(image, detach=True, network=net_name)
+        # 1. Find the Network Name dynamically
+        # We need the 'private_net' so Nginx can reach the new nodes
+        networks = client.networks.list()
+        private_net = next((n for n in networks if "private_net" in n.name), None)
         
-        return jsonify({"status": "success", "msg": "Scaled up by 3 nodes."})
+        if not private_net:
+            return jsonify({"status": "error", "msg": "Private network not found!"})
+
+        # 2. Find the Image Name
+        # We use the existing backend as a template
+        running_backends = get_backend_containers()
+        if not running_backends:
+            return jsonify({"status": "error", "msg": "No template backend found."})
+        
+        image_name = running_backends[0].image.tags[0] if running_backends[0].image.tags else running_backends[0].image.id
+
+        # 3. Create 3 New Nodes with SPECIFIC names and ALIASES
+        created_names = []
+        for i in range(3):
+            unique_id = str(uuid.uuid4())[:8]
+            container_name = f"backend-auto-{unique_id}"
+            
+            # Start the container (Not attached to network yet to avoid race conditions)
+            container = client.containers.run(
+                image_name, 
+                detach=True,
+                name=container_name, 
+                network=None # We connect manually below
+            )
+            
+            # Connect to Private Network with alias 'backend'
+            # THIS IS KEY: The alias 'backend' allows Nginx to load balance to it!
+            private_net.connect(container, aliases=['backend'])
+            
+            created_names.append(container_name)
+        
+        return jsonify({"status": "success", "msg": f"Added: {', '.join(created_names)}"})
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)})
 
@@ -53,15 +85,20 @@ def scale_up():
 def kill_node():
     try:
         containers = get_backend_containers()
-        if not containers: return jsonify({"status": "error", "msg": "No nodes left to kill!"})
+        if not containers: return jsonify({"status": "error", "msg": "No nodes left!"})
         
+        # Don't kill the last one if possible, just to be nice
         victim = random.choice(containers)
+        name = victim.name
         victim.stop()
-        return jsonify({"status": "success", "msg": f"Stopped node {victim.short_id}"})
+        # Clean up the container so the name can be reused or just to keep things tidy
+        victim.remove()
+        
+        return jsonify({"status": "success", "msg": f"Killed {name}"})
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)})
 
-# --- UI ---
+# --- UI (Same as before) ---
 @app.route('/')
 def home():
     return """
@@ -79,12 +116,10 @@ def home():
             .dashboard { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; max-width: 1200px; margin: 0 auto; }
             .card { background: var(--card); padding: 25px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
             
-            /* Header Stats */
             .header-stat { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
             .live-badge { background: #d1fae5; color: #065f46; padding: 8px 16px; border-radius: 99px; font-weight: 700; display: flex; align-items: center; gap: 8px; font-size: 1.1rem; }
             .dot { height: 12px; width: 12px; background: var(--green); border-radius: 50%; display: inline-block; box-shadow: 0 0 0 4px #d1fae5; animation: pulse 2s infinite; }
             
-            /* Architecture Diagram */
             .diagram { display: flex; align-items: center; justify-content: space-between; padding: 40px 10px; position: relative; }
             .comp { text-align: center; font-weight: 600; font-size: 0.9rem; z-index: 2; }
             .comp i { font-size: 2.5rem; display: block; margin-bottom: 12px; color: #4b5563; background: #f3f4f6; padding: 20px; border-radius: 50%; }
@@ -93,13 +128,11 @@ def home():
             .arrow.active { background: var(--green); transition: 0.2s; }
             .arrow.active::after { color: var(--green); }
 
-            /* Grid */
             .grid-container { background: #f8fafc; border-radius: 12px; padding: 20px; margin-top: 10px; min-height: 100px; display: flex; flex-wrap: wrap; gap: 12px; align-content: flex-start; }
             .node { background: white; border: 2px solid #e2e8f0; padding: 10px 15px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; display: flex; align-items: center; gap: 8px; transition: all 0.3s ease; }
             .node.new { animation: popIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
             .node.traffic { border-color: var(--green); box-shadow: 0 0 0 4px #d1fae5; transform: translateY(-2px); }
             
-            /* Controls */
             .btn { width: 100%; padding: 16px; border: none; border-radius: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; transition: transform 0.1s; text-align: left; }
             .btn:active { transform: scale(0.98); }
             .btn-scale { background: #eff6ff; color: #1e40af; border: 1px solid #dbeafe; }
@@ -123,24 +156,14 @@ def home():
             </div>
 
             <div class="diagram">
-                <div class="comp">
-                    <i class="fas fa-laptop"></i>
-                    Client
-                </div>
+                <div class="comp"><i class="fas fa-laptop"></i>Client</div>
                 <div class="arrow" id="arrow1"></div>
-                <div class="comp">
-                    <i class="fas fa-project-diagram"></i>
-                    Load Balancer
-                </div>
+                <div class="comp"><i class="fas fa-project-diagram"></i>Load Balancer</div>
                 <div class="arrow" id="arrow2"></div>
-                <div class="comp" style="flex: 2">
-                    <i class="fas fa-server"></i>
-                    Backend Cluster
-                </div>
+                <div class="comp" style="flex: 2"><i class="fas fa-server"></i>Backend Cluster</div>
             </div>
             
-            <div class="grid-container" id="nodeGrid">
-                </div>
+            <div class="grid-container" id="nodeGrid"></div>
         </div>
 
         <div class="card">
@@ -148,18 +171,12 @@ def home():
             <p style="color: #666; font-size: 0.9rem; margin-bottom: 25px;">Manipulate the infrastructure in real-time.</p>
 
             <button class="btn btn-scale" onclick="apiAction('/api/scale', 'Scaling up...')">
-                <span>
-                    <div style="font-size:1.1rem">Add Resources</div>
-                    <small>+3 Nodes (Scalability)</small>
-                </span>
+                <span><div style="font-size:1.1rem">Add Resources</div><small>+3 Nodes (Scalability)</small></span>
                 <i class="fas fa-plus-circle fa-lg"></i>
             </button>
 
             <button class="btn btn-kill" onclick="apiAction('/api/kill', 'Killing node...')">
-                <span>
-                    <div style="font-size:1.1rem">Simulate Failure</div>
-                    <small>Crash 1 Node (Fault Tolerance)</small>
-                </span>
+                <span><div style="font-size:1.1rem">Simulate Failure</div><small>Crash 1 Node (Fault Tolerance)</small></span>
                 <i class="fas fa-bomb fa-lg"></i>
             </button>
 
@@ -180,15 +197,13 @@ def home():
         let isRunning = false;
         let trafficInterval;
         
-        // 1. SYSTEM MONITOR (Runs always)
-        // Polls Docker every 1s to get the Source of Truth
         setInterval(async () => {
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
                 updateGrid(data.nodes);
                 document.getElementById('nodeCount').innerText = data.count;
-            } catch(e) { console.error("Monitor error", e); }
+            } catch(e) {}
         }, 1000);
 
         function updateGrid(activeIds) {
@@ -196,26 +211,22 @@ def home():
             const currentElements = Array.from(grid.children);
             const currentIds = currentElements.map(el => el.id);
             
-            // Add New Nodes
             activeIds.forEach(id => {
                 if (!currentIds.includes(id)) {
                     const div = document.createElement('div');
                     div.id = id;
                     div.className = 'node new';
-                    div.innerHTML = `<i class="fas fa-circle" style="color: #10b981; font-size: 0.6rem;"></i> ${id}`;
+                    div.innerHTML = `<i class="fas fa-circle" style="color: #10b981; font-size: 0.6rem;"></i> ${id.substring(0, 12)}`;
                     grid.appendChild(div);
                 }
             });
 
-            // Remove Dead Nodes
             currentElements.forEach(el => {
                 if (!activeIds.includes(el.id)) el.remove();
             });
         }
 
-        // 2. TRAFFIC SIMULATOR
         async function sendRequest() {
-            // Visuals
             document.getElementById('arrow1').classList.add('active');
             setTimeout(() => document.getElementById('arrow2').classList.add('active'), 150);
             setTimeout(() => {
@@ -228,9 +239,19 @@ def home():
                 const data = await res.json();
                 if (data.served_by_node) {
                     const nodeEl = document.getElementById(data.served_by_node);
-                    if (nodeEl) {
+                    if(!nodeEl) {
+                        // If we got a response from a node we don't see yet, look for its name in our grid
+                        const allNodes = document.querySelectorAll('.node');
+                        allNodes.forEach(n => {
+                            if(n.innerText.includes(data.served_by_node)) {
+                                n.classList.remove('traffic');
+                                void n.offsetWidth;
+                                n.classList.add('traffic');
+                            }
+                        })
+                    } else {
                         nodeEl.classList.remove('traffic');
-                        void nodeEl.offsetWidth; // Trigger reflow
+                        void nodeEl.offsetWidth; 
                         nodeEl.classList.add('traffic');
                     }
                     addLog(`200 OK from ${data.served_by_node}`);
@@ -252,7 +273,6 @@ def home():
             isRunning = !isRunning;
         }
 
-        // 3. ACTIONS
         async function apiAction(url, logMsg) {
             addLog(logMsg);
             await fetch(url);
