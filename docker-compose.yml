@@ -4,10 +4,11 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "9000:8080"  # Maps VM port 8080 to container port 8080
+      - "9000:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # <--- CRITICAL LINE
     networks:
       - public_net
-
   # 2. The Middleware: Bridges Public and Private networks
   loadbalancer:
     image: nginx:alpine
