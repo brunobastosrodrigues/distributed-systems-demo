@@ -1,73 +1,67 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 import requests
 import docker
 import random
-import time
 
 app = Flask(__name__)
-docker_client = docker.from_env()
+client = docker.from_env()
 
-# --- Helper to identify backend components ---
-def get_backend_info():
-    """Finds a running backend container to copy its config."""
-    containers = docker_client.containers.list()
-    for c in containers:
-        # We look for containers that are NOT the frontend or loadbalancer
-        if "backend" in c.name and "frontend" not in c.name:
-            return c
-    return None
-
-# --- API Endpoints for Automation ---
-
+# --- Backend Logic (Traffic) ---
 @app.route('/get-data')
 def get_data():
     try:
         response = requests.get('http://loadbalancer:80/api', timeout=1)
         return jsonify(response.json())
     except:
-        return jsonify({"served_by_node": "Offline", "message": "Backend Unreachable"})
+        return jsonify({"served_by_node": "Offline"})
+
+# --- Control Plane Logic (Docker Management) ---
+def get_backend_containers():
+    """Returns a list of all Docker containers that are 'backend' nodes."""
+    return [c for c in client.containers.list() if "backend" in c.name and "frontend" not in c.name]
+
+@app.route('/api/status')
+def get_status():
+    """Returns the exact count and IDs of live nodes from Docker."""
+    containers = get_backend_containers()
+    active_nodes = [c.short_id for c in containers]
+    return jsonify({
+        "count": len(active_nodes), 
+        "nodes": active_nodes
+    })
 
 @app.route('/api/scale')
 def scale_up():
-    """Simulates Horizontal Scaling: Adds 3 new containers."""
     try:
-        template = get_backend_info()
-        if not template:
-            return jsonify({"status": "error", "msg": "No backend found to copy!"})
-        
-        # Get the network name (e.g., distributed-demo_private_net)
-        net_name = list(template.attrs['NetworkSettings']['Networks'].keys())[0]
-        image_name = template.image.tags[0] if template.image.tags else template.image.id
+        # Find any running backend to use as a template
+        containers = get_backend_containers()
+        if not containers: return jsonify({"status": "error", "msg": "No template node found!"})
+        template = containers[0]
 
-        # Launch 3 new nodes
-        created = []
+        net_name = list(template.attrs['NetworkSettings']['Networks'].keys())[0]
+        image = template.image.tags[0] if template.image.tags else template.image.id
+
+        # Add 3 nodes
         for i in range(3):
-            c = docker_client.containers.run(
-                image_name,
-                detach=True,
-                network=net_name,
-                environment={"Target": "AutoScaled"}
-            )
-            created.append(c.short_id)
+            client.containers.run(image, detach=True, network=net_name)
         
-        return jsonify({"status": "success", "msg": f"Scaled up! Added {len(created)} nodes.", "ids": created})
+        return jsonify({"status": "success", "msg": "Scaled up by 3 nodes."})
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)})
 
 @app.route('/api/kill')
 def kill_node():
-    """Simulates a Crash: Stops one random backend container."""
     try:
-        template = get_backend_info()
-        if not template: 
-            return jsonify({"status": "error", "msg": "System already dead."})
-
-        template.stop()
-        return jsonify({"status": "success", "msg": f"CRASHED node {template.short_id}!"})
+        containers = get_backend_containers()
+        if not containers: return jsonify({"status": "error", "msg": "No nodes left to kill!"})
+        
+        victim = random.choice(containers)
+        victim.stop()
+        return jsonify({"status": "success", "msg": f"Stopped node {victim.short_id}"})
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)})
 
-# --- Frontend UI ---
+# --- UI ---
 @app.route('/')
 def home():
     return """
@@ -76,189 +70,200 @@ def home():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Distributed Control Plane</title>
+        <title>Distributed Admin Console</title>
         <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
         <style>
-            :root { --primary: #2c3e50; --accent: #3498db; --danger: #e74c3c; --success: #27ae60; --bg: #f4f6f9; }
-            body { font-family: 'Segoe UI', sans-serif; background: var(--bg); margin: 0; padding: 20px; color: #333; }
+            :root { --bg: #f0f2f5; --card: #ffffff; --text: #1a1a1a; --green: #10b981; --red: #ef4444; --blue: #3b82f6; }
+            body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
             
-            .main-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; max-width: 1200px; margin: 0 auto; }
-            .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); margin-bottom: 20px; }
-            h2 { border-bottom: 2px solid #eee; padding-bottom: 10px; margin-top: 0; color: var(--primary); }
+            .dashboard { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; max-width: 1200px; margin: 0 auto; }
+            .card { background: var(--card); padding: 25px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+            
+            /* Header Stats */
+            .header-stat { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+            .live-badge { background: #d1fae5; color: #065f46; padding: 8px 16px; border-radius: 99px; font-weight: 700; display: flex; align-items: center; gap: 8px; font-size: 1.1rem; }
+            .dot { height: 12px; width: 12px; background: var(--green); border-radius: 50%; display: inline-block; box-shadow: 0 0 0 4px #d1fae5; animation: pulse 2s infinite; }
+            
+            /* Architecture Diagram */
+            .diagram { display: flex; align-items: center; justify-content: space-between; padding: 40px 10px; position: relative; }
+            .comp { text-align: center; font-weight: 600; font-size: 0.9rem; z-index: 2; }
+            .comp i { font-size: 2.5rem; display: block; margin-bottom: 12px; color: #4b5563; background: #f3f4f6; padding: 20px; border-radius: 50%; }
+            .arrow { flex: 1; height: 2px; background: #e5e7eb; margin: 0 20px; position: relative; }
+            .arrow::after { content: '►'; position: absolute; right: 0; top: -6px; color: #e5e7eb; }
+            .arrow.active { background: var(--green); transition: 0.2s; }
+            .arrow.active::after { color: var(--green); }
 
-            /* Diagram Styles */
-            .diagram { display: flex; align-items: center; justify-content: space-around; padding: 20px 0; }
-            .comp { text-align: center; font-size: 0.9rem; font-weight: bold; }
-            .comp i { font-size: 2.5rem; margin-bottom: 10px; display: block; }
-            .arrow { font-size: 1.5rem; color: #ccc; }
-            .arrow.active { color: var(--success); transition: color 0.2s; }
-
-            /* Backend Grid */
-            .node-grid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; justify-content: center; }
-            .node { background: #ecf0f1; padding: 8px 12px; border-radius: 6px; font-size: 0.8rem; border: 2px solid transparent; transition: all 0.3s; opacity: 0.7; }
-            .node.active { border-color: var(--success); background: #fff; opacity: 1; transform: scale(1.1); box-shadow: 0 5px 15px rgba(39, 174, 96, 0.3); }
-
-            /* Log Table */
-            table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-            td, th { padding: 8px; border-bottom: 1px solid #eee; text-align: left; }
+            /* Grid */
+            .grid-container { background: #f8fafc; border-radius: 12px; padding: 20px; margin-top: 10px; min-height: 100px; display: flex; flex-wrap: wrap; gap: 12px; align-content: flex-start; }
+            .node { background: white; border: 2px solid #e2e8f0; padding: 10px 15px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; display: flex; align-items: center; gap: 8px; transition: all 0.3s ease; }
+            .node.new { animation: popIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+            .node.traffic { border-color: var(--green); box-shadow: 0 0 0 4px #d1fae5; transform: translateY(-2px); }
             
-            /* Action Buttons */
-            .btn-theory { width: 100%; padding: 12px; margin-bottom: 10px; border: none; border-radius: 6px; cursor: pointer; text-align: left; background: #fff; border: 1px solid #ddd; transition: 0.2s; display: flex; align-items: center; justify-content: space-between; }
-            .btn-theory:hover { background: #f8f9fa; border-color: var(--accent); }
-            .btn-theory i { font-size: 1.2rem; color: var(--accent); }
-            .btn-theory strong { display: block; font-size: 1rem; }
-            .btn-theory small { color: #666; font-size: 0.8rem; }
+            /* Controls */
+            .btn { width: 100%; padding: 16px; border: none; border-radius: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; transition: transform 0.1s; text-align: left; }
+            .btn:active { transform: scale(0.98); }
+            .btn-scale { background: #eff6ff; color: #1e40af; border: 1px solid #dbeafe; }
+            .btn-kill { background: #fef2f2; color: #991b1b; border: 1px solid #fee2e2; }
+            .btn-traffic { background: var(--text); color: white; justify-content: center; margin-top: 20px; }
             
-            /* Toast Notification */
-            #toast { visibility: hidden; min-width: 250px; background-color: #333; color: #fff; text-align: center; border-radius: 4px; padding: 16px; position: fixed; z-index: 1; left: 50%; bottom: 30px; transform: translateX(-50%); }
-            #toast.show { visibility: visible; -webkit-animation: fadein 0.5s, fadeout 0.5s 2.5s; animation: fadein 0.5s, fadeout 0.5s 2.5s; }
-            
-            @keyframes fadein { from {bottom: 0; opacity: 0;} to {bottom: 30px; opacity: 1;} }
-            @keyframes fadeout { from {bottom: 30px; opacity: 1;} to {bottom: 0; opacity: 0;} }
+            @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); } 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); } }
+            @keyframes popIn { from { opacity: 0; transform: scale(0.5); } to { opacity: 1; transform: scale(1); } }
         </style>
     </head>
     <body>
 
-    <div class="main-grid">
-        <div>
-            <div class="card">
-                <h2>🏛️ Live Architecture</h2>
-                <div class="diagram">
-                    <div class="comp"><i class="fas fa-laptop" style="color:#34495e"></i>Client</div>
-                    <div class="arrow" id="arrow1">➡</div>
-                    <div class="comp"><i class="fas fa-random" style="color:#e67e22"></i>Load Balancer</div>
-                    <div class="arrow" id="arrow2">➡</div>
-                    <div class="comp" style="flex-grow: 1">
-                        <i class="fas fa-server" style="color:#27ae60"></i> Backend Cluster
-                        <div class="node-grid" id="backendGrid"></div>
-                    </div>
+    <div class="dashboard">
+        <div class="card">
+            <div class="header-stat">
+                <h2>Architecture View</h2>
+                <div class="live-badge">
+                    <span class="dot"></span>
+                    <span id="nodeCount">...</span> Active Nodes
+                </div>
+            </div>
+
+            <div class="diagram">
+                <div class="comp">
+                    <i class="fas fa-laptop"></i>
+                    Client
+                </div>
+                <div class="arrow" id="arrow1"></div>
+                <div class="comp">
+                    <i class="fas fa-project-diagram"></i>
+                    Load Balancer
+                </div>
+                <div class="arrow" id="arrow2"></div>
+                <div class="comp" style="flex: 2">
+                    <i class="fas fa-server"></i>
+                    Backend Cluster
                 </div>
             </div>
             
-            <div class="card">
-                <h2>📊 Traffic Log</h2>
-                <table>
-                    <thead><tr><th>Time</th><th>Node ID</th><th>Status</th></tr></thead>
-                    <tbody id="logBody"></tbody>
-                </table>
-            </div>
+            <div class="grid-container" id="nodeGrid">
+                </div>
         </div>
 
-        <div>
-            <div class="card">
-                <h2>🎮 Interactive Demo</h2>
-                <p style="font-size: 0.9rem; color: #666; margin-bottom: 20px;">Click a concept to execute it live on the cluster.</p>
+        <div class="card">
+            <h2>Control Plane</h2>
+            <p style="color: #666; font-size: 0.9rem; margin-bottom: 25px;">Manipulate the infrastructure in real-time.</p>
 
-                <button class="btn-theory" onclick="runDemo('scalability')">
-                    <div>
-                        <strong>2. Scalability</strong>
-                        <small>Auto-add 3 new nodes to the cluster</small>
-                    </div>
-                    <i class="fas fa-layer-group"></i>
-                </button>
+            <button class="btn btn-scale" onclick="apiAction('/api/scale', 'Scaling up...')">
+                <span>
+                    <div style="font-size:1.1rem">Add Resources</div>
+                    <small>+3 Nodes (Scalability)</small>
+                </span>
+                <i class="fas fa-plus-circle fa-lg"></i>
+            </button>
 
-                <button class="btn-theory" onclick="runDemo('fault')">
-                    <div>
-                        <strong>3. Fault Tolerance</strong>
-                        <small>Crash (Kill) a random active node</small>
-                    </div>
-                    <i class="fas fa-heart-broken" style="color: var(--danger)"></i>
-                </button>
-                
-                <hr style="border: 0; border-top: 1px solid #eee; margin: 15px 0;">
-                
-                <div style="text-align: center;">
-                    <button onclick="toggleTraffic(true)" id="startBtn" style="background:var(--success); color:white; border:none; padding:10px 20px; border-radius:4px; cursor:pointer;">▶ Start Traffic</button>
-                    <button onclick="toggleTraffic(false)" id="stopBtn" style="background:var(--danger); color:white; border:none; padding:10px 20px; border-radius:4px; cursor:pointer; display:none;">⏹ Stop Traffic</button>
+            <button class="btn btn-kill" onclick="apiAction('/api/kill', 'Killing node...')">
+                <span>
+                    <div style="font-size:1.1rem">Simulate Failure</div>
+                    <small>Crash 1 Node (Fault Tolerance)</small>
+                </span>
+                <i class="fas fa-bomb fa-lg"></i>
+            </button>
+
+            <button class="btn btn-traffic" id="trafficBtn" onclick="toggleTraffic()">
+                <i class="fas fa-play" style="margin-right: 8px;"></i> Start Traffic Simulation
+            </button>
+            
+            <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #eee;">
+                <h3>Latest Logs</h3>
+                <div id="logs" style="font-family: monospace; font-size: 0.8rem; color: #666; height: 150px; overflow: hidden; position: relative;">
+                    <div style="position: absolute; bottom: 0; width: 100%;" id="logContent"></div>
                 </div>
             </div>
         </div>
     </div>
 
-    <div id="toast">Action Executed!</div>
-
     <script>
-        let interval = null;
-        let knownNodes = new Set();
+        let isRunning = false;
+        let trafficInterval;
         
-        // Color Helper
-        function getColor(str) {
-            let hash = 0;
-            for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
-            return '#' + '00000'.substring(0, 6 - (hash & 0x00FFFFFF).toString(16).toUpperCase().length) + (hash & 0x00FFFFFF).toString(16).toUpperCase();
+        // 1. SYSTEM MONITOR (Runs always)
+        // Polls Docker every 1s to get the Source of Truth
+        setInterval(async () => {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                updateGrid(data.nodes);
+                document.getElementById('nodeCount').innerText = data.count;
+            } catch(e) { console.error("Monitor error", e); }
+        }, 1000);
+
+        function updateGrid(activeIds) {
+            const grid = document.getElementById('nodeGrid');
+            const currentElements = Array.from(grid.children);
+            const currentIds = currentElements.map(el => el.id);
+            
+            // Add New Nodes
+            activeIds.forEach(id => {
+                if (!currentIds.includes(id)) {
+                    const div = document.createElement('div');
+                    div.id = id;
+                    div.className = 'node new';
+                    div.innerHTML = `<i class="fas fa-circle" style="color: #10b981; font-size: 0.6rem;"></i> ${id}`;
+                    grid.appendChild(div);
+                }
+            });
+
+            // Remove Dead Nodes
+            currentElements.forEach(el => {
+                if (!activeIds.includes(el.id)) el.remove();
+            });
         }
 
-        async function fetchTraffic() {
-            // Visual Arrows
+        // 2. TRAFFIC SIMULATOR
+        async function sendRequest() {
+            // Visuals
             document.getElementById('arrow1').classList.add('active');
             setTimeout(() => document.getElementById('arrow2').classList.add('active'), 150);
-            
-            try {
-                const res = await fetch('/get-data');
-                const data = await res.json();
-                
-                if (data.served_by_node) {
-                    const id = data.served_by_node;
-                    
-                    // Auto-Discover Nodes
-                    if (!knownNodes.has(id) && id !== "Offline") {
-                        knownNodes.add(id);
-                        renderGrid();
-                    }
-                    
-                    // Highlight Active
-                    document.querySelectorAll('.node').forEach(n => n.classList.remove('active'));
-                    const el = document.getElementById('node-'+id);
-                    if(el) el.classList.add('active');
-
-                    // Log
-                    const row = `<tr><td>${new Date().toLocaleTimeString()}</td><td><span style="color:${getColor(id)}; font-weight:bold">${id}</span></td><td>OK</td></tr>`;
-                    document.getElementById('logBody').insertAdjacentHTML('afterbegin', row);
-                }
-            } catch(e) { console.log(e); }
-
             setTimeout(() => {
                 document.getElementById('arrow1').classList.remove('active');
                 document.getElementById('arrow2').classList.remove('active');
             }, 500);
+
+            try {
+                const res = await fetch('/get-data');
+                const data = await res.json();
+                if (data.served_by_node) {
+                    const nodeEl = document.getElementById(data.served_by_node);
+                    if (nodeEl) {
+                        nodeEl.classList.remove('traffic');
+                        void nodeEl.offsetWidth; // Trigger reflow
+                        nodeEl.classList.add('traffic');
+                    }
+                    addLog(`200 OK from ${data.served_by_node}`);
+                }
+            } catch(e) {}
         }
 
-        function renderGrid() {
-            const grid = document.getElementById('backendGrid');
-            grid.innerHTML = '';
-            knownNodes.forEach(id => {
-                grid.innerHTML += `<div class="node" id="node-${id}" style="border-left: 5px solid ${getColor(id)}">${id}</div>`;
-            });
-        }
-
-        async function runDemo(type) {
-            showToast("Executing Docker Command...");
-            if (type === 'scalability') {
-                await fetch('/api/scale');
-                showToast("✅ Scaled Up! Watch the grid.");
-            } else if (type === 'fault') {
-                await fetch('/api/kill');
-                showToast("⚠️ Node Crashed! System recovering...");
-            }
-        }
-
-        function toggleTraffic(enable) {
-            if (enable) {
-                interval = setInterval(fetchTraffic, 1000);
-                document.getElementById('startBtn').style.display = 'none';
-                document.getElementById('stopBtn').style.display = 'inline-block';
+        function toggleTraffic() {
+            const btn = document.getElementById('trafficBtn');
+            if (isRunning) {
+                clearInterval(trafficInterval);
+                btn.innerHTML = '<i class="fas fa-play" style="margin-right: 8px;"></i> Start Traffic Simulation';
+                btn.style.background = '#1a1a1a';
             } else {
-                clearInterval(interval);
-                document.getElementById('startBtn').style.display = 'inline-block';
-                document.getElementById('stopBtn').style.display = 'none';
+                trafficInterval = setInterval(sendRequest, 800);
+                btn.innerHTML = '<i class="fas fa-stop" style="margin-right: 8px;"></i> Stop Traffic';
+                btn.style.background = '#ef4444';
             }
+            isRunning = !isRunning;
         }
-        
-        function showToast(msg) {
-            const x = document.getElementById("toast");
-            x.innerText = msg;
-            x.className = "show";
-            setTimeout(function(){ x.className = x.className.replace("show", ""); }, 3000);
+
+        // 3. ACTIONS
+        async function apiAction(url, logMsg) {
+            addLog(logMsg);
+            await fetch(url);
+        }
+
+        function addLog(msg) {
+            const container = document.getElementById('logContent');
+            const div = document.createElement('div');
+            div.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            container.appendChild(div);
+            if (container.children.length > 8) container.firstChild.remove();
         }
     </script>
     </body>
