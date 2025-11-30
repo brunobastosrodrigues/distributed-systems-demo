@@ -1,83 +1,65 @@
+# frontend/app.py
 from flask import Flask, jsonify
 import requests
 import docker
 import random
 import uuid
-import time
 
 app = Flask(__name__)
 client = docker.from_env()
 
-# --- Backend Logic (Traffic) ---
+# --- TRAFFIC LOGIC ---
 @app.route('/get-data')
 def get_data():
     try:
-        # 1 sec timeout so the UI doesn't freeze if Nginx is slow
+        # 1s timeout to prevent UI freezing
         response = requests.get('http://loadbalancer:80/api', timeout=1)
         return jsonify(response.json())
     except Exception as e:
         return jsonify({"served_by_node": "Offline", "error": str(e)})
 
-# --- Control Plane Logic ---
+# --- CONTROL PLANE LOGIC ---
 
 def get_backend_containers():
-    """Returns list of backend containers based on name or image."""
-    # Improved Filter: Looks for "backend" in the name OR the original image name
-    return [
-        c for c in client.containers.list() 
-        if "backend" in c.name and "frontend" not in c.name
-    ]
+    """Finds all containers acting as backend nodes."""
+    return [c for c in client.containers.list() if "backend" in c.name and "frontend" not in c.name]
 
 @app.route('/api/status')
 def get_status():
-    """Returns real-time census from Docker Engine."""
+    """Returns the live census of the cluster."""
     containers = get_backend_containers()
+    # Clean up names for display
     active_nodes = [c.name.replace("distributed-systems-demo-", "") for c in containers]
-    return jsonify({
-        "count": len(active_nodes), 
-        "nodes": active_nodes
-    })
+    return jsonify({"count": len(active_nodes), "nodes": active_nodes})
 
 @app.route('/api/scale')
 def scale_up():
     try:
-        # 1. Find the Network Name dynamically
-        # We need the 'private_net' so Nginx can reach the new nodes
+        # 1. Locate the Private Network
         networks = client.networks.list()
+        # Find the network object that contains 'private_net' in its name
         private_net = next((n for n in networks if "private_net" in n.name), None)
-        
-        if not private_net:
-            return jsonify({"status": "error", "msg": "Private network not found!"})
+        if not private_net: return jsonify({"status": "error", "msg": "Private network missing!"})
 
-        # 2. Find the Image Name
-        # We use the existing backend as a template
-        running_backends = get_backend_containers()
-        if not running_backends:
-            return jsonify({"status": "error", "msg": "No template backend found."})
-        
-        image_name = running_backends[0].image.tags[0] if running_backends[0].image.tags else running_backends[0].image.id
+        # 2. Find a template image from an existing backend
+        running = get_backend_containers()
+        if not running: return jsonify({"status": "error", "msg": "No template found."})
+        image_name = running[0].image.tags[0] if running[0].image.tags else running[0].image.id
 
-        # 3. Create 3 New Nodes with SPECIFIC names and ALIASES
+        # 3. Launch 3 New Nodes
         created_names = []
         for i in range(3):
             unique_id = str(uuid.uuid4())[:8]
-            container_name = f"backend-auto-{unique_id}"
+            name = f"backend-auto-{unique_id}"
             
-            # Start the container (Not attached to network yet to avoid race conditions)
-            container = client.containers.run(
-                image_name, 
-                detach=True,
-                name=container_name, 
-                network=None # We connect manually below
-            )
+            # Start container detached (not on network yet)
+            c = client.containers.run(image_name, detach=True, name=name, network=None)
             
-            # Connect to Private Network with alias 'backend'
-            # THIS IS KEY: The alias 'backend' allows Nginx to load balance to it!
-            private_net.connect(container, aliases=['backend'])
-            
-            created_names.append(container_name)
+            # Connect to Private Network with alias 'backend' so Nginx can find it
+            private_net.connect(c, aliases=['backend'])
+            created_names.append(name)
         
-        return jsonify({"status": "success", "msg": f"Added: {', '.join(created_names)}"})
+        return jsonify({"status": "success", "msg": f"Launched: {', '.join(created_names)}"})
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)})
 
@@ -87,18 +69,15 @@ def kill_node():
         containers = get_backend_containers()
         if not containers: return jsonify({"status": "error", "msg": "No nodes left!"})
         
-        # Don't kill the last one if possible, just to be nice
         victim = random.choice(containers)
         name = victim.name
         victim.stop()
-        # Clean up the container so the name can be reused or just to keep things tidy
-        victim.remove()
-        
-        return jsonify({"status": "success", "msg": f"Killed {name}"})
+        victim.remove() # Clean up
+        return jsonify({"status": "success", "msg": f"Terminated {name}"})
     except Exception as e:
         return jsonify({"status": "error", "msg": str(e)})
 
-# --- UI (Same as before) ---
+# --- UI CODE ---
 @app.route('/')
 def home():
     return """
@@ -107,183 +86,213 @@ def home():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Distributed Admin Console</title>
+        <title>Distributed Systems Lab</title>
         <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
         <style>
-            :root { --bg: #f0f2f5; --card: #ffffff; --text: #1a1a1a; --green: #10b981; --red: #ef4444; --blue: #3b82f6; }
-            body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
+            :root { --bg: #f8fafc; --surface: #ffffff; --primary: #3b82f6; --success: #22c55e; --danger: #ef4444; }
+            body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); margin: 0; padding: 20px; color: #1e293b; }
             
-            .dashboard { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; max-width: 1200px; margin: 0 auto; }
-            .card { background: var(--card); padding: 25px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+            .dashboard { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; max-width: 1400px; margin: 0 auto; }
+            .card { background: var(--surface); padding: 24px; border-radius: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
             
-            .header-stat { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
-            .live-badge { background: #d1fae5; color: #065f46; padding: 8px 16px; border-radius: 99px; font-weight: 700; display: flex; align-items: center; gap: 8px; font-size: 1.1rem; }
-            .dot { height: 12px; width: 12px; background: var(--green); border-radius: 50%; display: inline-block; box-shadow: 0 0 0 4px #d1fae5; animation: pulse 2s infinite; }
+            h2 { margin-top: 0; font-size: 1.25rem; display: flex; align-items: center; justify-content: space-between; }
+            .badge { background: #dcfce7; color: #15803d; padding: 4px 12px; border-radius: 99px; font-size: 0.875rem; font-weight: 600; }
             
-            .diagram { display: flex; align-items: center; justify-content: space-between; padding: 40px 10px; position: relative; }
-            .comp { text-align: center; font-weight: 600; font-size: 0.9rem; z-index: 2; }
-            .comp i { font-size: 2.5rem; display: block; margin-bottom: 12px; color: #4b5563; background: #f3f4f6; padding: 20px; border-radius: 50%; }
-            .arrow { flex: 1; height: 2px; background: #e5e7eb; margin: 0 20px; position: relative; }
-            .arrow::after { content: '►'; position: absolute; right: 0; top: -6px; color: #e5e7eb; }
-            .arrow.active { background: var(--green); transition: 0.2s; }
-            .arrow.active::after { color: var(--green); }
+            /* Diagram */
+            .diagram { display: flex; align-items: center; padding: 40px 0; }
+            .node-icon { display: flex; flex-direction: column; align-items: center; z-index: 2; position: relative; }
+            .icon-circle { width: 64px; height: 64px; background: #f1f5f9; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.5rem; color: #64748b; margin-bottom: 8px; border: 2px solid #e2e8f0; transition: all 0.3s; }
+            .arrow { flex: 1; height: 2px; background: #e2e8f0; margin: 0 -10px; position: relative; z-index: 1; }
+            .arrow::after { content: '►'; position: absolute; right: 50%; top: -8px; color: #cbd5e1; font-size: 12px; background: var(--bg); padding: 0 4px; }
+            
+            .arrow.active { background: var(--success); }
+            .arrow.active::after { color: var(--success); }
+            .node-icon.pulse .icon-circle { border-color: var(--success); color: var(--success); background: #f0fdf4; box-shadow: 0 0 0 4px #dcfce7; }
 
-            .grid-container { background: #f8fafc; border-radius: 12px; padding: 20px; margin-top: 10px; min-height: 100px; display: flex; flex-wrap: wrap; gap: 12px; align-content: flex-start; }
-            .node { background: white; border: 2px solid #e2e8f0; padding: 10px 15px; border-radius: 8px; font-family: monospace; font-size: 0.9rem; display: flex; align-items: center; gap: 8px; transition: all 0.3s ease; }
-            .node.new { animation: popIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
-            .node.traffic { border-color: var(--green); box-shadow: 0 0 0 4px #d1fae5; transform: translateY(-2px); }
+            /* Grid */
+            .grid { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; min-height: 100px; align-content: flex-start; }
+            .backend-node { background: white; border: 2px solid #e2e8f0; padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 0.85rem; display: flex; align-items: center; gap: 8px; animation: popIn 0.3s ease; }
+            .backend-node i { font-size: 0.6rem; color: #cbd5e1; }
+            .backend-node.online { border-color: #cbd5e1; }
+            .backend-node.active { border-color: var(--success); background: #f0fdf4; box-shadow: 0 4px 6px -1px rgba(34, 197, 94, 0.2); transform: translateY(-2px); }
+            .backend-node.active i { color: var(--success); }
+
+            /* Buttons */
+            .btn { width: 100%; padding: 16px; border: none; border-radius: 12px; cursor: pointer; text-align: left; margin-bottom: 12px; transition: transform 0.1s; position: relative; overflow: hidden; }
+            .btn:active { transform: scale(0.99); }
+            .btn-blue { background: #eff6ff; color: #1d4ed8; border: 1px solid #dbeafe; }
+            .btn-blue:hover { background: #dbeafe; }
+            .btn-red { background: #fef2f2; color: #b91c1c; border: 1px solid #fee2e2; }
+            .btn-red:hover { background: #fee2e2; }
+            .btn-black { background: #0f172a; color: white; text-align: center; justify-content: center; display: flex; align-items: center; gap: 8px; margin-top: auto; }
             
-            .btn { width: 100%; padding: 16px; border: none; border-radius: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; transition: transform 0.1s; text-align: left; }
-            .btn:active { transform: scale(0.98); }
-            .btn-scale { background: #eff6ff; color: #1e40af; border: 1px solid #dbeafe; }
-            .btn-kill { background: #fef2f2; color: #991b1b; border: 1px solid #fee2e2; }
-            .btn-traffic { background: var(--text); color: white; justify-content: center; margin-top: 20px; }
-            
-            @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); } 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); } }
-            @keyframes popIn { from { opacity: 0; transform: scale(0.5); } to { opacity: 1; transform: scale(1); } }
+            /* Logs */
+            .log-window { background: #0f172a; color: #94a3b8; padding: 16px; border-radius: 12px; height: 200px; overflow: hidden; font-family: monospace; font-size: 0.8rem; display: flex; flex-direction: column; justify-content: flex-end; }
+            .log-entry { margin-bottom: 4px; border-left: 2px solid transparent; padding-left: 8px; }
+            .log-entry.success { border-color: var(--success); color: #dcfce7; }
+            .log-entry.error { border-color: var(--danger); color: #fecaca; }
+
+            @keyframes popIn { from { opacity:0; transform:scale(0.9); } to { opacity:1; transform:scale(1); } }
         </style>
     </head>
     <body>
 
     <div class="dashboard">
         <div class="card">
-            <div class="header-stat">
-                <h2>Architecture View</h2>
-                <div class="live-badge">
-                    <span class="dot"></span>
-                    <span id="nodeCount">...</span> Active Nodes
+            <h2>Architecture <span class="badge" id="nodeCount">Initializing...</span></h2>
+            
+            <div class="diagram">
+                <div class="node-icon" id="icon-client">
+                    <div class="icon-circle"><i class="fas fa-laptop"></i></div>
+                    <small>Client</small>
+                </div>
+                <div class="arrow" id="arrow1"></div>
+                <div class="node-icon" id="icon-lb">
+                    <div class="icon-circle"><i class="fas fa-sitemap"></i></div>
+                    <small>Load Balancer</small>
+                </div>
+                <div class="arrow" id="arrow2"></div>
+                <div class="node-icon" id="icon-cluster">
+                    <div class="icon-circle"><i class="fas fa-server"></i></div>
+                    <small>Backend Cluster</small>
                 </div>
             </div>
 
-            <div class="diagram">
-                <div class="comp"><i class="fas fa-laptop"></i>Client</div>
-                <div class="arrow" id="arrow1"></div>
-                <div class="comp"><i class="fas fa-project-diagram"></i>Load Balancer</div>
-                <div class="arrow" id="arrow2"></div>
-                <div class="comp" style="flex: 2"><i class="fas fa-server"></i>Backend Cluster</div>
+            <div style="background: #f8fafc; border-radius: 12px; padding: 20px; margin-top: 20px;">
+                <small style="color: #64748b; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">Active Containers</small>
+                <div class="grid" id="backendGrid"></div>
             </div>
-            
-            <div class="grid-container" id="nodeGrid"></div>
         </div>
 
-        <div class="card">
-            <h2>Control Plane</h2>
-            <p style="color: #666; font-size: 0.9rem; margin-bottom: 25px;">Manipulate the infrastructure in real-time.</p>
-
-            <button class="btn btn-scale" onclick="apiAction('/api/scale', 'Scaling up...')">
-                <span><div style="font-size:1.1rem">Add Resources</div><small>+3 Nodes (Scalability)</small></span>
-                <i class="fas fa-plus-circle fa-lg"></i>
-            </button>
-
-            <button class="btn btn-kill" onclick="apiAction('/api/kill', 'Killing node...')">
-                <span><div style="font-size:1.1rem">Simulate Failure</div><small>Crash 1 Node (Fault Tolerance)</small></span>
-                <i class="fas fa-bomb fa-lg"></i>
-            </button>
-
-            <button class="btn btn-traffic" id="trafficBtn" onclick="toggleTraffic()">
-                <i class="fas fa-play" style="margin-right: 8px;"></i> Start Traffic Simulation
-            </button>
+        <div class="card" style="display: flex; flex-direction: column;">
+            <h2 style="margin-bottom: 20px;">Control Plane</h2>
             
-            <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #eee;">
-                <h3>Latest Logs</h3>
-                <div id="logs" style="font-family: monospace; font-size: 0.8rem; color: #666; height: 150px; overflow: hidden; position: relative;">
-                    <div style="position: absolute; bottom: 0; width: 100%;" id="logContent"></div>
-                </div>
+            <button class="btn btn-blue" onclick="apiAction('/api/scale')">
+                <div style="font-weight: 700; font-size: 1rem;">Add Resources</div>
+                <div style="font-size: 0.85rem; opacity: 0.8;">+3 Nodes (Scalability)</div>
+                <i class="fas fa-plus-circle" style="position: absolute; right: 20px; top: 50%; transform: translateY(-50%); font-size: 1.5rem; opacity: 0.5;"></i>
+            </button>
+
+            <button class="btn btn-red" onclick="apiAction('/api/kill')">
+                <div style="font-weight: 700; font-size: 1rem;">Simulate Failure</div>
+                <div style="font-size: 0.85rem; opacity: 0.8;">Crash 1 Node (Fault Tolerance)</div>
+                <i class="fas fa-heart-broken" style="position: absolute; right: 20px; top: 50%; transform: translateY(-50%); font-size: 1.5rem; opacity: 0.5;"></i>
+            </button>
+
+            <div class="log-window" id="logContainer">
+                <div>System ready. Waiting for traffic...</div>
             </div>
+
+            <button class="btn btn-black" id="trafficBtn" onclick="toggleTraffic()">
+                <i class="fas fa-play"></i> Start Traffic
+            </button>
         </div>
     </div>
 
     <script>
-        let isRunning = false;
         let trafficInterval;
-        
+        let isRunning = false;
+
+        // 1. POLLING (The Source of Truth)
         setInterval(async () => {
             try {
                 const res = await fetch('/api/status');
                 const data = await res.json();
-                updateGrid(data.nodes);
-                document.getElementById('nodeCount').innerText = data.count;
+                renderGrid(data.nodes);
+                document.getElementById('nodeCount').innerText = `${data.count} Nodes Active`;
             } catch(e) {}
         }, 1000);
 
-        function updateGrid(activeIds) {
-            const grid = document.getElementById('nodeGrid');
-            const currentElements = Array.from(grid.children);
-            const currentIds = currentElements.map(el => el.id);
+        function renderGrid(nodes) {
+            const grid = document.getElementById('backendGrid');
+            const existingIds = Array.from(grid.children).map(el => el.id);
             
-            activeIds.forEach(id => {
-                if (!currentIds.includes(id)) {
-                    const div = document.createElement('div');
-                    div.id = id;
-                    div.className = 'node new';
-                    div.innerHTML = `<i class="fas fa-circle" style="color: #10b981; font-size: 0.6rem;"></i> ${id.substring(0, 12)}`;
-                    grid.appendChild(div);
+            // Add new
+            nodes.forEach(id => {
+                if(!existingIds.includes(id)) {
+                    const el = document.createElement('div');
+                    el.className = 'backend-node';
+                    el.id = id;
+                    el.innerHTML = `<i class="fas fa-circle"></i> ${id.substring(0, 10)}...`;
+                    grid.appendChild(el);
                 }
             });
 
-            currentElements.forEach(el => {
-                if (!activeIds.includes(el.id)) el.remove();
+            // Remove old
+            Array.from(grid.children).forEach(el => {
+                if(!nodes.includes(el.id)) el.remove();
             });
         }
 
+        // 2. TRAFFIC SIMULATION
         async function sendRequest() {
+            // Animate Diagram
             document.getElementById('arrow1').classList.add('active');
-            setTimeout(() => document.getElementById('arrow2').classList.add('active'), 150);
+            document.getElementById('icon-lb').classList.add('pulse');
+            
             setTimeout(() => {
-                document.getElementById('arrow1').classList.remove('active');
-                document.getElementById('arrow2').classList.remove('active');
+                document.getElementById('arrow2').classList.add('active');
+                document.getElementById('icon-cluster').classList.add('pulse');
+            }, 150);
+
+            setTimeout(() => {
+                document.querySelectorAll('.active, .pulse').forEach(el => el.classList.remove('active', 'pulse'));
             }, 500);
 
             try {
                 const res = await fetch('/get-data');
                 const data = await res.json();
-                if (data.served_by_node) {
-                    const nodeEl = document.getElementById(data.served_by_node);
-                    if(!nodeEl) {
-                        // If we got a response from a node we don't see yet, look for its name in our grid
-                        const allNodes = document.querySelectorAll('.node');
-                        allNodes.forEach(n => {
-                            if(n.innerText.includes(data.served_by_node)) {
-                                n.classList.remove('traffic');
-                                void n.offsetWidth;
-                                n.classList.add('traffic');
-                            }
-                        })
-                    } else {
-                        nodeEl.classList.remove('traffic');
-                        void nodeEl.offsetWidth; 
-                        nodeEl.classList.add('traffic');
+                
+                if(data.served_by_node) {
+                    // Highlight the specific node
+                    const nodeId = data.served_by_node; 
+                    // Note: The ID from get-data corresponds to hostname (Short ID), 
+                    // but our status API returns Names. We match loosely.
+                    const gridNodes = document.getElementById('backendGrid').children;
+                    for(let node of gridNodes) {
+                        if(node.innerText.includes(nodeId) || nodeId.includes(node.id)) {
+                            node.classList.remove('active');
+                            void node.offsetWidth; // Trigger reflow
+                            node.classList.add('active');
+                        }
                     }
-                    addLog(`200 OK from ${data.served_by_node}`);
+                    log(`200 OK from ${nodeId}`, 'success');
                 }
-            } catch(e) {}
+            } catch(e) {
+                log('Request failed', 'error');
+            }
         }
 
         function toggleTraffic() {
             const btn = document.getElementById('trafficBtn');
-            if (isRunning) {
+            if(isRunning) {
                 clearInterval(trafficInterval);
-                btn.innerHTML = '<i class="fas fa-play" style="margin-right: 8px;"></i> Start Traffic Simulation';
-                btn.style.background = '#1a1a1a';
+                btn.innerHTML = '<i class="fas fa-play"></i> Start Traffic';
+                btn.style.background = '#0f172a';
             } else {
                 trafficInterval = setInterval(sendRequest, 800);
-                btn.innerHTML = '<i class="fas fa-stop" style="margin-right: 8px;"></i> Stop Traffic';
+                btn.innerHTML = '<i class="fas fa-stop"></i> Stop Traffic';
                 btn.style.background = '#ef4444';
             }
             isRunning = !isRunning;
         }
 
-        async function apiAction(url, logMsg) {
-            addLog(logMsg);
-            await fetch(url);
+        async function apiAction(endpoint) {
+            log('Executing command...', 'normal');
+            try {
+                const res = await fetch(endpoint);
+                const data = await res.json();
+                log(data.msg, data.status === 'success' ? 'success' : 'error');
+            } catch(e) { log(e, 'error'); }
         }
 
-        function addLog(msg) {
-            const container = document.getElementById('logContent');
+        function log(msg, type) {
             const div = document.createElement('div');
-            div.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            div.className = `log-entry ${type}`;
+            div.innerText = `> ${msg}`;
+            const container = document.getElementById('logContainer');
             container.appendChild(div);
-            if (container.children.length > 8) container.firstChild.remove();
+            if(container.children.length > 8) container.firstChild.remove();
         }
     </script>
     </body>

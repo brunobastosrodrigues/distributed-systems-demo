@@ -6,10 +6,9 @@ app = Flask(__name__)
 
 @app.route('/api')
 def hello():
-    # Returns the container ID (Hostname) to prove where the response came from
     return jsonify({
         "message": "Hello from the distributed backend!",
-        "served_by_node": socket.gethostname(),
+        "served_by_node": socket.gethostname(), # Returns Container ID
         "architecture": "Python/Flask Backend"
     })
 
